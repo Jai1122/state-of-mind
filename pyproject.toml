@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lgdebug"
+version = "0.1.0"
+description = "State debugger and visualizer for LangGraph — Redux DevTools for AI agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "State of Mind Contributors" },
+]
+keywords = ["langgraph", "debugger", "state", "ai", "agents", "visualization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Debuggers",
+]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "websockets>=12.0",
+    "pydantic>=2.0",
+    "aiosqlite>=0.19.0",
+]
+
+[project.optional-dependencies]
+langgraph = ["langgraph>=0.2.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.25.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[project.scripts]
+lgdebug = "lgdebug.cli.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/state-of-mind/lgdebug"
+Documentation = "https://github.com/state-of-mind/lgdebug#readme"
+Issues = "https://github.com/state-of-mind/lgdebug/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lgdebug"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
