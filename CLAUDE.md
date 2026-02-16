@@ -8,7 +8,15 @@ This is a developer tool, not a prototype. It is designed for open-source releas
 
 ## Architecture (One Paragraph)
 
-A **LangGraph adapter** wraps each node function to capture state_before/state_after with zero node code changes. The **collector** serializes states, runs the **diff engine**, decides checkpoint vs diff-only storage, writes to the **SQLite storage** layer, and broadcasts to WebSocket subscribers. The **replay engine** reconstructs state at any step from checkpoint + diffs without re-executing the graph. A **FastAPI server** exposes REST + WebSocket endpoints. A **React/TypeScript/Tailwind frontend** provides timeline, diff viewer, JSON inspector, replay slider, and routing inspector.
+A **LangGraph adapter** wraps each node's `.func` inside its `RunnableCallable` to capture state_before/state_after with zero node code changes. The **collector** (fully synchronous, thread-safe via `threading.Lock`) serializes states, runs the **diff engine**, decides checkpoint vs diff-only storage, and writes to **SyncSQLiteStorage** (stdlib `sqlite3`). The **debug server** (FastAPI + async `aiosqlite`) reads from the same database via WAL mode and exposes REST + WebSocket endpoints. The **replay engine** (async, used by server) reconstructs state at any step from checkpoint + diffs without re-executing the graph. A **React/TypeScript/Tailwind frontend** provides timeline, diff viewer, JSON inspector, replay slider, and routing inspector.
+
+## Critical Architecture Rule: Sync vs Async Split
+
+The instrumentation layer (adapter, collector, `SyncSQLiteStorage`) is **fully synchronous**. This is non-negotiable — LangGraph runs sync node functions inside its own async event loop, so any `asyncio.run()` or `await` in the instrumentation path causes deadlocks.
+
+The server layer (FastAPI, `SQLiteStorage`, `ReplayEngine`) is **async**. It runs in its own uvicorn event loop separate from the instrumented graph.
+
+Both layers share the same `.lgdebug/debug.db` file. WAL mode enables concurrent access.
 
 ## Directory Layout
 
@@ -19,15 +27,16 @@ src/lgdebug/
     models.py        — Execution, ExecutionStep, StateDiff, RoutingDecision
     diff.py          — compute_diff() and apply_diff() — recursive structural diff
     serialization.py — serialize_state() — handles Pydantic, dataclasses, enums, circular refs
-    collector.py     — DebugCollector — central coordinator, module-level singleton
+    collector.py     — DebugCollector — SYNC, thread-safe, uses SyncSQLiteStorage
   adapters/
     base.py          — FrameworkAdapter ABC
     langgraph.py     — LangGraph instrumentation, enable_debugging() public API
   storage/
-    base.py          — StorageBackend ABC
-    sqlite.py        — SQLite with WAL, checkpoint+diff strategy
+    base.py          — StorageBackend async ABC (for server/replay only)
+    sqlite.py        — Async SQLite (aiosqlite) — used by debug server
+    sqlite_sync.py   — Sync SQLite (stdlib sqlite3) — used by instrumentation
   replay/
-    engine.py        — ReplayEngine — deterministic state reconstruction
+    engine.py        — ReplayEngine (async) — deterministic state reconstruction
   server/
     app.py           — FastAPI app factory, REST + WebSocket endpoints
   cli/
@@ -50,8 +59,8 @@ frontend/src/
 tests/
   unit/test_diff.py            — 14 tests: compute_diff + apply_diff
   unit/test_serialization.py   — 14 tests: all type handlers + edge cases
-  unit/test_storage.py         — 4 tests: CRUD + state reconstruction
-  integration/test_collector.py — 2 tests: full pipeline record + replay
+  unit/test_storage.py         — 4 tests: CRUD + state reconstruction (sync)
+  integration/test_collector.py — 2 tests: full pipeline record + replay (sync)
 
 examples/
   research_agent.py            — LangGraph integration demo with simulation fallback
@@ -90,20 +99,35 @@ cd frontend && npm run dev     # vite dev server on :6275
 
 ## Key Design Decisions
 
-1. **Zero node modification** — the adapter wraps node callables via `enable_debugging(graph)`. User node code is never touched.
-2. **Checkpoint + diff storage** — full state snapshots every N steps (default 10), diffs between. Reconstruction applies at most N-1 diffs. Configurable via `DebugConfig.checkpoint_interval`.
-3. **O(n) list diffing** — element-wise comparison, not LCS. LangGraph message lists are append-only in practice, so this is correct and fast.
-4. **Never-fail serialization** — `serialize_state()` handles Pydantic v1/v2, dataclasses, enums, circular refs, bytes, and falls back to `repr()`. It never raises.
-5. **Framework-agnostic core** — diff engine, storage, collector, replay, and server know nothing about LangGraph. Only `adapters/langgraph.py` is framework-specific.
-6. **Local-first** — SQLite, no SaaS. WAL mode for concurrent reads during writes.
-7. **Replay without re-execution** — `apply_diff(state, diff)` reconstructs state purely from stored data.
+1. **Zero node modification** — the adapter patches `.func` inside LangGraph's `RunnableCallable` objects via `enable_debugging(graph)`. User node code is never touched.
+2. **Fully synchronous instrumentation** — collector and storage use stdlib `sqlite3` and `threading.Lock`. No `asyncio` in the hot path. This prevents deadlocks when LangGraph runs sync nodes inside its own event loop.
+3. **Checkpoint + diff storage** — full state snapshots every N steps (default 10), diffs between. Reconstruction applies at most N-1 diffs. Configurable via `DebugConfig.checkpoint_interval`.
+4. **O(n) list diffing** — element-wise comparison, not LCS. LangGraph message lists are append-only in practice, so this is correct and fast.
+5. **Never-fail serialization** — `serialize_state()` handles Pydantic v1/v2, dataclasses, enums, circular refs, bytes, and falls back to `repr()`. It never raises.
+6. **Framework-agnostic core** — diff engine, storage, collector, replay, and server know nothing about LangGraph. Only `adapters/langgraph.py` is framework-specific.
+7. **Local-first** — SQLite, no SaaS. WAL mode for concurrent reads during writes.
+8. **Replay without re-execution** — `apply_diff(state, diff)` reconstructs state purely from stored data.
+
+## LangGraph 1.0.x Internals (Critical for Adapter Work)
+
+The adapter must understand LangGraph's internal structures:
+
+- `graph.nodes`: `dict[str, StateNodeSpec]` — NOT plain callables
+- `StateNodeSpec.runnable`: `RunnableCallable` from `langgraph._internal._runnable`
+- `RunnableCallable.func`: the actual Python function to wrap
+- `RunnableCallable.afunc`: optional async variant (wrap both if present)
+- `graph.branches`: `defaultdict(dict)` mapping `source_node -> {name -> BranchSpec}`
+- `BranchSpec.path`: `RunnableCallable` wrapping the router function
+- `BranchSpec.path.func`: the actual router function to wrap
+
+**Never replace the `RunnableCallable` itself** — only patch its `.func` attribute. Replacing the whole object breaks LangGraph's type expectations.
 
 ## Conventions
 
 - **Python**: 3.10+, type hints everywhere, `from __future__ import annotations` in every module, line length 100, ruff for linting.
-- **Async**: storage and collector are async (aiosqlite). Adapters bridge sync node functions to async collector via `asyncio.get_running_loop().create_task()` or `asyncio.run()` fallback.
+- **Sync/Async boundary**: Instrumentation layer (adapters, collector, `SyncSQLiteStorage`) is fully synchronous. Server layer (`SQLiteStorage`, `ReplayEngine`, FastAPI) is async. Never mix them.
 - **Frontend**: React 18, TypeScript strict mode with `noUncheckedIndexedAccess`, Tailwind CSS, Vite bundler. Dark theme with `surface-0/1/2/3` and `accent-blue/green/red/yellow/purple` palette.
-- **Tests**: pytest + pytest-asyncio with `asyncio_mode = "auto"`. Fixtures use `tempfile.TemporaryDirectory` for isolated SQLite instances.
+- **Tests**: pytest (sync tests). Fixtures use `tempfile.mkdtemp()` for isolated SQLite instances.
 - **No Pydantic in core models** — domain models are plain dataclasses to avoid coupling. Pydantic is only a dependency for FastAPI request/response handling.
 
 ## Common Patterns
@@ -115,18 +139,19 @@ cd frontend && npm run dev     # vite dev server on :6275
 
 ### Adding a new framework adapter
 1. Create `src/lgdebug/adapters/newframework.py` implementing `FrameworkAdapter`.
-2. The adapter's `instrument()` method wraps the framework's execution to call `collector.record_step()` with state_before/state_after.
+2. The adapter's `instrument()` method wraps the framework's execution to call `collector.record_step()` (sync) with state_before/state_after.
 3. Add a public `enable_debugging()` shortcut function.
 
 ### Adding a new storage backend
-1. Create `src/lgdebug/storage/newbackend.py` implementing `StorageBackend`.
-2. Must implement `get_state_at_step()` with checkpoint+diff reconstruction logic (or can use `apply_diff` from `core/diff.py`).
+1. For instrumentation: create a sync storage class (no ABC needed — duck typing).
+2. For server: implement `StorageBackend` async ABC from `storage/base.py`.
 
 ## Things to Watch Out For
 
+- **NEVER use `asyncio.run()` or `await` in instrumentation code** — LangGraph runs sync nodes inside its own event loop. This WILL deadlock.
 - **Node.js version**: Frontend requires Node >= 18. The machine has nvm with v22 available — use `nvm use 22` before `npm` commands. Default is v14 which will fail on `||=` syntax.
 - **`noUncheckedIndexedAccess`** in tsconfig: array indexing returns `T | undefined`. Always guard with `if (item)` or use `?.` before accessing properties.
-- **Sync/async bridge in adapter**: LangGraph nodes can be sync or async. The wrapper must match the original's nature. Sync wrappers use `create_task()` or `asyncio.run()` fallback to call the async collector.
+- **LangGraph adapter wraps `.func`, not the `RunnableCallable`**: Replacing the entire `RunnableCallable` with a plain function breaks LangGraph's internal type expectations.
 - **Deep copy safety**: `safe_deepcopy()` falls back to serialize round-trip when `copy.deepcopy()` fails (some LLM response objects don't support it).
 - **SQLite WAL files**: `.db-wal` and `.db-shm` are expected alongside the `.db` file. The `lgdebug clean` command removes all three.
 

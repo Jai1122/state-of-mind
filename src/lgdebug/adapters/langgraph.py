@@ -32,7 +32,6 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
 import logging
@@ -43,7 +42,7 @@ from lgdebug.adapters.base import FrameworkAdapter
 from lgdebug.core.collector import DebugCollector, get_collector, set_collector
 from lgdebug.core.config import DebugConfig
 from lgdebug.core.serialization import safe_deepcopy, serialize_state
-from lgdebug.storage.sqlite import SQLiteStorage
+from lgdebug.storage.sqlite_sync import SyncSQLiteStorage
 
 logger = logging.getLogger("lgdebug.langgraph")
 
@@ -77,57 +76,74 @@ class LangGraphAdapter(FrameworkAdapter):
     def _instrument_state_graph(self, graph: Any) -> Any:
         """Wrap nodes in an uncompiled StateGraph.
 
-        Strategy: replace each node's function with a wrapper that captures state.
-        The StateGraph.nodes dict maps name -> NodeSpec or function.
+        LangGraph 1.0.x internal structure:
+            graph.nodes: dict[str, StateNodeSpec]
+            StateNodeSpec.runnable: RunnableCallable
+            RunnableCallable.func: the original Python function
+
+        We replace .func inside the RunnableCallable so LangGraph's
+        execution engine (which expects RunnableCallable objects) is unaffected.
+
+            graph.branches: defaultdict(dict) mapping
+                source_node -> {router_name -> BranchSpec}
+            BranchSpec.path: RunnableCallable wrapping the router function
         """
-        wrapped_nodes: dict[str, Any] = {}
+        node_count = 0
         for name, node_spec in graph.nodes.items():
             if name in ("__start__", "__end__"):
                 continue
-            # node_spec can be a function or a NodeSpec(runnable=...).
-            if callable(node_spec):
-                wrapped_nodes[name] = _wrap_node_function(name, node_spec, self.config)
-            elif hasattr(node_spec, "runnable"):
-                original = node_spec.runnable
-                node_spec.runnable = _wrap_node_function(name, original, self.config)
-            elif hasattr(node_spec, "func"):
-                original = node_spec.func
-                node_spec.func = _wrap_node_function(name, original, self.config)
 
-        # Update the graph's node registry with wrapped versions.
-        for name, wrapped in wrapped_nodes.items():
-            graph.nodes[name] = wrapped
+            # StateNodeSpec → RunnableCallable → func
+            runnable = getattr(node_spec, "runnable", None)
+            if runnable is not None and hasattr(runnable, "func"):
+                original_func = runnable.func
+                runnable.func = _wrap_node_function(name, original_func, self.config)
+                # Also wrap the async variant if present.
+                if hasattr(runnable, "afunc") and runnable.afunc is not None:
+                    runnable.afunc = _wrap_node_function(name, runnable.afunc, self.config)
+                node_count += 1
+            elif callable(node_spec):
+                # Fallback for older LangGraph versions where nodes are plain callables.
+                graph.nodes[name] = _wrap_node_function(name, node_spec, self.config)
+                node_count += 1
 
-        # Wrap conditional edges.
-        if hasattr(graph, "_conditional_edges"):
-            for edge_key, edge_spec in graph._conditional_edges.items():
-                if hasattr(edge_spec, "path") and callable(edge_spec.path):
-                    original_path = edge_spec.path
-                    edge_spec.path = _wrap_conditional_edge(
-                        edge_key, original_path, self.config
-                    )
+        # Wrap conditional edges (stored in graph.branches in LangGraph 1.0.x).
+        branches = getattr(graph, "branches", None)
+        if branches:
+            for source_node, branch_map in branches.items():
+                for branch_name, branch_spec in branch_map.items():
+                    path_runnable = getattr(branch_spec, "path", None)
+                    if path_runnable is not None and hasattr(path_runnable, "func"):
+                        original_path = path_runnable.func
+                        path_runnable.func = _wrap_conditional_edge(
+                            source_node, original_path, self.config
+                        )
 
-        logger.info(
-            "Instrumented StateGraph with %d nodes", len(graph.nodes) - 2  # exclude start/end
-        )
+        logger.info("Instrumented StateGraph with %d nodes", node_count)
         return graph
 
     def _instrument_compiled_graph(self, graph: Any) -> Any:
         """Wrap nodes in an already-compiled graph.
 
         CompiledStateGraph.nodes is a dict of name -> PregelNode.
-        Each PregelNode has a .bound attribute that is the actual callable.
+        PregelNode wraps a RunnableCallable which has .func/.afunc.
         """
+        node_count = 0
         for name, node in graph.nodes.items():
             if name in ("__start__", "__end__"):
                 continue
-            if hasattr(node, "bound") and callable(node.bound):
-                original = node.bound
-                node.bound = _wrap_node_function(name, original, self.config)
+            # PregelNode → .bound (RunnableCallable) → .func
+            bound = getattr(node, "bound", None)
+            if bound is not None and hasattr(bound, "func"):
+                bound.func = _wrap_node_function(name, bound.func, self.config)
+                if hasattr(bound, "afunc") and bound.afunc is not None:
+                    bound.afunc = _wrap_node_function(name, bound.afunc, self.config)
+                node_count += 1
             elif callable(node):
                 graph.nodes[name] = _wrap_node_function(name, node, self.config)
+                node_count += 1
 
-        logger.info("Instrumented CompiledGraph with %d nodes", len(graph.nodes))
+        logger.info("Instrumented CompiledGraph with %d nodes", node_count)
         return graph
 
 
@@ -136,6 +152,8 @@ def _wrap_node_function(node_name: str, fn: Any, config: DebugConfig) -> Any:
 
     The wrapper must match the original function's sync/async nature so
     LangGraph's execution engine doesn't break.
+
+    All collector calls are synchronous — no event loop manipulation.
     """
     if inspect.iscoroutinefunction(fn):
 
@@ -150,9 +168,9 @@ def _wrap_node_function(node_name: str, fn: Any, config: DebugConfig) -> Any:
 
             try:
                 result = await fn(state, *args, **kwargs)
-                # Merge result into state to get state_after.
                 state_after = _compute_state_after(state_before, result)
-                await collector.record_step(
+                # Collector is synchronous — safe to call from any context.
+                collector.record_step(
                     execution_id=execution_id,
                     node_name=node_name,
                     state_before=state_before,
@@ -160,11 +178,11 @@ def _wrap_node_function(node_name: str, fn: Any, config: DebugConfig) -> Any:
                 )
                 return result
             except Exception as exc:
-                await collector.record_step(
+                collector.record_step(
                     execution_id=execution_id,
                     node_name=node_name,
                     state_before=state_before,
-                    state_after=state_before,  # state unchanged on error
+                    state_after=state_before,
                     error=str(exc),
                 )
                 raise
@@ -184,14 +202,19 @@ def _wrap_node_function(node_name: str, fn: Any, config: DebugConfig) -> Any:
             try:
                 result = fn(state, *args, **kwargs)
                 state_after = _compute_state_after(state_before, result)
-                # Run async collector method from sync context.
-                _sync_record_step(
-                    collector, execution_id, node_name, state_before, state_after
+                collector.record_step(
+                    execution_id=execution_id,
+                    node_name=node_name,
+                    state_before=state_before,
+                    state_after=state_after,
                 )
                 return result
             except Exception as exc:
-                _sync_record_step(
-                    collector, execution_id, node_name, state_before, state_before,
+                collector.record_step(
+                    execution_id=execution_id,
+                    node_name=node_name,
+                    state_before=state_before,
+                    state_after=state_before,
                     error=str(exc),
                 )
                 raise
@@ -210,23 +233,18 @@ def _wrap_conditional_edge(
         result = condition_fn(state)
 
         if collector is not None and config.enabled:
-            # Extract condition inputs from state that the condition likely reads.
-            condition_inputs = serialize_state(state)
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    collector.record_routing(
-                        step_id="",  # will be filled by the next step
-                        source_node=str(edge_key),
-                        target_node=str(result),
-                        condition_description=_get_function_description(condition_fn),
-                        condition_inputs=condition_inputs,
-                        evaluated_value=result,
-                    )
+                condition_inputs = serialize_state(state)
+                collector.record_routing(
+                    step_id="",
+                    source_node=str(edge_key),
+                    target_node=str(result),
+                    condition_description=_get_function_description(condition_fn),
+                    condition_inputs=condition_inputs,
+                    evaluated_value=result,
                 )
-            except RuntimeError:
-                # No event loop — schedule via sync bridge.
-                pass
+            except Exception:
+                logger.debug("Failed to record routing decision", exc_info=True)
 
         return result
 
@@ -297,40 +315,6 @@ def _get_or_create_execution_id(state: Any, kwargs: dict[str, Any]) -> str:
     return _execution_tracker.get_current()
 
 
-def _sync_record_step(
-    collector: DebugCollector,
-    execution_id: str,
-    node_name: str,
-    state_before: Any,
-    state_after: Any,
-    *,
-    error: str | None = None,
-) -> None:
-    """Bridge sync node execution to async collector."""
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(
-            collector.record_step(
-                execution_id=execution_id,
-                node_name=node_name,
-                state_before=state_before,
-                state_after=state_after,
-                error=error,
-            )
-        )
-    except RuntimeError:
-        # No running event loop — create one for this call.
-        asyncio.run(
-            collector.record_step(
-                execution_id=execution_id,
-                node_name=node_name,
-                state_before=state_before,
-                state_after=state_after,
-                error=error,
-            )
-        )
-
-
 class _ExecutionTracker:
     """Simple execution ID tracker using contextvars for async safety."""
 
@@ -391,23 +375,14 @@ def enable_debugging(
         return graph
 
     # Initialize storage and collector if not already done.
+    # Fully synchronous — no event loop manipulation.
     collector = get_collector()
     if collector is None:
-        storage = SQLiteStorage(config.db_path)
-        # Run init synchronously — this happens once at import time.
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_init_collector(config, storage))
-        except RuntimeError:
-            asyncio.run(_init_collector(config, storage))
+        storage = SyncSQLiteStorage(config.db_path)
+        storage.initialize()
+        collector = DebugCollector(config, storage)
+        set_collector(collector)
+        logger.info("Debug collector initialized (db=%s)", config.db_path)
 
     adapter = LangGraphAdapter(config)
     return adapter.instrument(graph)
-
-
-async def _init_collector(config: DebugConfig, storage: SQLiteStorage) -> None:
-    """Initialize the global collector."""
-    await storage.initialize()
-    collector = DebugCollector(config, storage)
-    set_collector(collector)
-    logger.info("Debug collector initialized (db=%s)", config.db_path)

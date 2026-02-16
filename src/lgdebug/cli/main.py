@@ -121,86 +121,82 @@ def _cmd_server(args: argparse.Namespace) -> None:
 
 def _cmd_list(args: argparse.Namespace) -> None:
     """List executions from the database."""
-    import asyncio
-
-    from lgdebug.storage.sqlite import SQLiteStorage
+    from lgdebug.storage.sqlite_sync import SyncSQLiteStorage
 
     db_path = Path(".lgdebug/debug.db")
     if not db_path.exists():
         print("No debug data found. Run your LangGraph app with debugging enabled first.")
         return
 
-    async def _list() -> None:
-        storage = SQLiteStorage(db_path)
-        await storage.initialize()
-        executions = await storage.list_executions()
-        await storage.close()
+    storage = SyncSQLiteStorage(db_path)
+    storage.initialize()
+    executions = storage.list_executions()
+    storage.close()
 
-        if not executions:
-            print("No executions recorded.")
-            return
+    if not executions:
+        print("No executions recorded.")
+        return
 
-        print(f"\n{'ID':<20} {'Graph':<20} {'Status':<12} {'Steps':<8} {'Started'}")
-        print("-" * 80)
-        for ex in executions:
-            print(
-                f"{ex['execution_id']:<20} "
-                f"{ex['graph_name']:<20} "
-                f"{ex['status']:<12} "
-                f"{ex['step_count']:<8} "
-                f"{ex['started_at']}"
-            )
-        print()
-
-    asyncio.run(_list())
+    print(f"\n{'ID':<20} {'Graph':<20} {'Status':<12} {'Steps':<8} {'Started'}")
+    print("-" * 80)
+    for ex in executions:
+        print(
+            f"{ex['execution_id']:<20} "
+            f"{ex['graph_name']:<20} "
+            f"{ex['status']:<12} "
+            f"{ex['step_count']:<8} "
+            f"{ex['started_at']}"
+        )
+    print()
 
 
 def _cmd_show(args: argparse.Namespace) -> None:
     """Show detailed execution info."""
-    import asyncio
-    import json
-
-    from lgdebug.storage.sqlite import SQLiteStorage
+    from lgdebug.storage.sqlite_sync import SyncSQLiteStorage
 
     db_path = Path(".lgdebug/debug.db")
     if not db_path.exists():
         print("No debug data found.")
         return
 
-    async def _show() -> None:
-        storage = SQLiteStorage(db_path)
-        await storage.initialize()
-        execution = await storage.get_execution(args.execution_id)
-        if execution is None:
-            print(f"Execution '{args.execution_id}' not found.")
-            await storage.close()
-            return
+    storage = SyncSQLiteStorage(db_path)
+    storage.initialize()
+    execution = storage.get_execution(args.execution_id)
+    if execution is None:
+        print(f"Execution '{args.execution_id}' not found.")
+        storage.close()
+        return
 
-        steps = await storage.list_steps(args.execution_id)
-        await storage.close()
+    steps = storage.list_steps(args.execution_id)
+    storage.close()
 
-        print(f"\nExecution: {execution.execution_id}")
-        print(f"Graph:     {execution.graph_name}")
-        print(f"Status:    {execution.status.value}")
-        print(f"Steps:     {execution.step_count}")
-        print(f"Started:   {execution.started_at.isoformat()}")
-        if execution.ended_at:
-            print(f"Ended:     {execution.ended_at.isoformat()}")
+    print(f"\nExecution: {execution.execution_id}")
+    print(f"Graph:     {execution.graph_name}")
+    print(f"Status:    {execution.status.value}")
+    print(f"Steps:     {execution.step_count}")
+    print(f"Started:   {execution.started_at.isoformat()}")
+    if execution.ended_at:
+        print(f"Ended:     {execution.ended_at.isoformat()}")
 
-        print(f"\nTimeline:")
-        for step in steps:
-            status_icon = {
-                "completed": "+",
-                "failed": "X",
-                "running": "~",
-            }.get(step["status"], "?")
-            diff = step["state_diff"]
-            changes = len(diff.get("changed", [])) + len(diff.get("added", [])) + len(diff.get("removed", []))
-            print(f"  [{status_icon}] {step['step_index']:>3}. {step['node_name']:<25} ({changes} changes)")
+    print(f"\nTimeline:")
+    for step in steps:
+        status_icon = {
+            "completed": "+",
+            "failed": "X",
+            "running": "~",
+        }.get(step["status"], "?")
+        diff = step["state_diff"]
+        changes = (
+            len(diff.get("changed", []))
+            + len(diff.get("added", []))
+            + len(diff.get("removed", []))
+        )
+        print(
+            f"  [{status_icon}] {step['step_index']:>3}. "
+            f"{step['node_name']:<25} ({changes} changes)"
+        )
 
-        print()
-
-    asyncio.run(_show())
+    print()
 
 
 def _cmd_clean(args: argparse.Namespace) -> None:

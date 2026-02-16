@@ -150,10 +150,11 @@ Central coordinator between adapters and storage. Responsibilities:
 2. Serializes and deep-copies state.
 3. Computes diffs.
 4. Decides checkpoint vs diff-only storage (every N steps).
-5. Persists to storage.
-6. Broadcasts events to WebSocket subscribers for live UI updates.
+5. Persists to storage via synchronous SQLite.
 
-Thread-safe via asyncio locks.
+Fully synchronous and thread-safe via `threading.Lock`. This avoids
+all async/event-loop conflicts when called from within LangGraph's
+execution engine (which runs sync node functions inside its own event loop).
 
 ### 3.5 Storage Layer (`src/lgdebug/storage/`)
 
@@ -176,8 +177,18 @@ routing_decisions(step_id, execution_id, source_node, target_node, condition_des
 Non-checkpoint steps store only the diff. Reconstruction walks backward to
 nearest checkpoint, then applies diffs forward. At most N-1 diffs to apply.
 
-**Abstract base:** `StorageBackend` ABC allows future backends (PostgreSQL,
-S3-backed, in-memory) without changing any other component.
+**Two implementations of the same schema:**
+- `SyncSQLiteStorage` (stdlib `sqlite3`) — used by the instrumentation layer
+  and collector. Fully synchronous, no event loop dependency. Thread-safe via
+  `threading.Lock`.
+- `SQLiteStorage` (async `aiosqlite`) — used by the debug server and replay
+  engine, which run in uvicorn's async event loop.
+
+Both connect to the same `.lgdebug/debug.db` file. WAL mode enables concurrent
+reads (server) while the instrumentation layer writes.
+
+**Abstract base:** `StorageBackend` async ABC allows future async backends
+(PostgreSQL, S3-backed) for the server layer.
 
 ### 3.6 Replay Engine (`src/lgdebug/replay/engine.py`)
 
@@ -237,8 +248,7 @@ Keyboard shortcuts: Arrow keys / j/k for step navigation, 1/2/3 for tabs.
    c. Wrapper computes state_after (merge)
    d. Collector serializes both states
    e. Diff engine computes structural diff
-   f. Storage persists step (checkpoint or diff-only)
-   g. WebSocket broadcast to connected UIs
+   f. Synchronous SQLite write persists step (checkpoint or diff-only)
 4. Execution ends, final state recorded
 5. UI fetches data via REST API
 6. Replay engine reconstructs any requested state
@@ -313,8 +323,9 @@ state-of-mind/
 │   │   ├── base.py              # FrameworkAdapter ABC
 │   │   └── langgraph.py         # LangGraph-specific instrumentation
 │   ├── storage/
-│   │   ├── base.py              # StorageBackend ABC
-│   │   └── sqlite.py            # SQLite implementation with checkpoint strategy
+│   │   ├── base.py              # StorageBackend async ABC (for server)
+│   │   ├── sqlite.py            # Async SQLite (aiosqlite) for debug server
+│   │   └── sqlite_sync.py       # Sync SQLite (stdlib) for instrumentation layer
 │   ├── replay/
 │   │   └── engine.py            # Deterministic state reconstruction
 │   ├── server/

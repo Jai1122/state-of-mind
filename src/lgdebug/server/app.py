@@ -10,12 +10,13 @@ Endpoints:
     GET  /api/executions/{id}/compare — compare two steps
     WS   /ws/live                     — live execution updates
 
-The server also serves the built frontend as static files.
+The server reads from the same SQLite database (WAL mode) that the
+instrumentation layer writes to. It uses the async aiosqlite backend
+since FastAPI routes are async and run in uvicorn's event loop.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
@@ -23,10 +24,8 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from lgdebug.core.collector import DebugCollector, EventCallback
 from lgdebug.core.config import DebugConfig
 from lgdebug.replay.engine import ReplayEngine
 from lgdebug.storage.sqlite import SQLiteStorage
@@ -58,7 +57,7 @@ def create_app(config: DebugConfig | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Shared state: storage and replay engine.
+    # Shared state: async storage for the server + replay engine.
     storage = SQLiteStorage(config.db_path)
     replay = ReplayEngine(storage)
 
@@ -91,7 +90,6 @@ def create_app(config: DebugConfig | None = None) -> FastAPI:
     async def get_steps(execution_id: str) -> list[dict[str, Any]]:
         steps = await storage.list_steps(execution_id)
         if not steps:
-            # Check if execution exists at all.
             execution = await storage.get_execution(execution_id)
             if execution is None:
                 raise HTTPException(status_code=404, detail="Execution not found")
@@ -136,7 +134,6 @@ def create_app(config: DebugConfig | None = None) -> FastAPI:
         _ws_clients.add(ws)
         logger.info("WebSocket client connected (total=%d)", len(_ws_clients))
         try:
-            # Keep connection alive — client sends pings.
             while True:
                 await ws.receive_text()
         except WebSocketDisconnect:
@@ -177,12 +174,3 @@ async def broadcast_event(event_type: str, data: dict[str, Any]) -> None:
             disconnected.add(ws)
 
     _ws_clients.difference_update(disconnected)
-
-
-def create_ws_subscriber() -> EventCallback:
-    """Create an event callback that broadcasts to WebSocket clients."""
-
-    async def subscriber(event_type: str, data: dict[str, Any]) -> None:
-        await broadcast_event(event_type, data)
-
-    return subscriber
