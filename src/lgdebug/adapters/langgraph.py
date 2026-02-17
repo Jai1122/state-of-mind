@@ -13,6 +13,10 @@ Integration strategy:
 
     For conditional edges, we wrap the condition functions similarly.
 
+    Execution lifecycle is managed by wrapping the compiled graph's
+    invoke()/ainvoke() methods so that start_execution() is called before
+    the graph runs and end_execution() after it completes.
+
     This approach requires ZERO changes to user node code. The developer
     simply calls enable_debugging(graph) before graph.compile().
 
@@ -41,6 +45,7 @@ from uuid import uuid4
 from lgdebug.adapters.base import FrameworkAdapter
 from lgdebug.core.collector import DebugCollector, get_collector, set_collector
 from lgdebug.core.config import DebugConfig
+from lgdebug.core.models import StepStatus
 from lgdebug.core.serialization import safe_deepcopy, serialize_state
 from lgdebug.storage.sqlite_sync import SyncSQLiteStorage
 
@@ -119,6 +124,18 @@ class LangGraphAdapter(FrameworkAdapter):
                             source_node, original_path, self.config
                         )
 
+        # Monkey-patch compile() so that the compiled graph gets lifecycle wrapping.
+        original_compile = graph.compile
+        config = self.config
+
+        @functools.wraps(original_compile)
+        def patched_compile(*args: Any, **kwargs: Any) -> Any:
+            compiled = original_compile(*args, **kwargs)
+            _wrap_invoke_methods(compiled, config)
+            return compiled
+
+        graph.compile = patched_compile  # type: ignore[method-assign]
+
         logger.info("Instrumented StateGraph with %d nodes", node_count)
         return graph
 
@@ -143,8 +160,95 @@ class LangGraphAdapter(FrameworkAdapter):
                 graph.nodes[name] = _wrap_node_function(name, node, self.config)
                 node_count += 1
 
+        # Wrap invoke/ainvoke for execution lifecycle.
+        _wrap_invoke_methods(graph, self.config)
+
         logger.info("Instrumented CompiledGraph with %d nodes", node_count)
         return graph
+
+
+def _wrap_invoke_methods(compiled_graph: Any, config: DebugConfig) -> None:
+    """Wrap invoke()/ainvoke() on a compiled graph for execution lifecycle.
+
+    This ensures start_execution() is called before the graph runs and
+    end_execution() after it completes, so all steps share a single
+    execution ID and the execution record is properly created.
+    """
+    # Extract graph name from the compiled graph.
+    graph_name = getattr(compiled_graph, "name", None) or type(compiled_graph).__name__
+
+    # Wrap invoke().
+    original_invoke = compiled_graph.invoke
+
+    @functools.wraps(original_invoke)
+    def wrapped_invoke(input: Any, *args: Any, **kwargs: Any) -> Any:
+        collector = get_collector()
+        if collector is None or not config.enabled:
+            return original_invoke(input, *args, **kwargs)
+
+        execution_id = uuid4().hex[:16]
+        _execution_tracker.set_current(execution_id)
+
+        initial_state = serialize_state(safe_deepcopy(input)) if isinstance(input, dict) else {}
+        collector.start_execution(
+            execution_id=execution_id,
+            graph_name=graph_name,
+            initial_state=initial_state,
+        )
+
+        try:
+            result = original_invoke(input, *args, **kwargs)
+            final_state = serialize_state(safe_deepcopy(result)) if isinstance(result, dict) else {}
+            collector.end_execution(execution_id=execution_id, final_state=final_state)
+            return result
+        except Exception:
+            collector.end_execution(
+                execution_id=execution_id,
+                final_state=initial_state,
+                status=StepStatus.FAILED,
+            )
+            raise
+        finally:
+            _execution_tracker.set_current("")
+
+    compiled_graph.invoke = wrapped_invoke  # type: ignore[method-assign]
+
+    # Wrap ainvoke() if present.
+    original_ainvoke = getattr(compiled_graph, "ainvoke", None)
+    if original_ainvoke is not None:
+
+        @functools.wraps(original_ainvoke)
+        async def wrapped_ainvoke(input: Any, *args: Any, **kwargs: Any) -> Any:
+            collector = get_collector()
+            if collector is None or not config.enabled:
+                return await original_ainvoke(input, *args, **kwargs)
+
+            execution_id = uuid4().hex[:16]
+            _execution_tracker.set_current(execution_id)
+
+            initial_state = serialize_state(safe_deepcopy(input)) if isinstance(input, dict) else {}
+            collector.start_execution(
+                execution_id=execution_id,
+                graph_name=graph_name,
+                initial_state=initial_state,
+            )
+
+            try:
+                result = await original_ainvoke(input, *args, **kwargs)
+                final_state = serialize_state(safe_deepcopy(result)) if isinstance(result, dict) else {}
+                collector.end_execution(execution_id=execution_id, final_state=final_state)
+                return result
+            except Exception:
+                collector.end_execution(
+                    execution_id=execution_id,
+                    final_state=initial_state,
+                    status=StepStatus.FAILED,
+                )
+                raise
+            finally:
+                _execution_tracker.set_current("")
+
+        compiled_graph.ainvoke = wrapped_ainvoke  # type: ignore[method-assign]
 
 
 def _wrap_node_function(node_name: str, fn: Any, config: DebugConfig) -> Any:
